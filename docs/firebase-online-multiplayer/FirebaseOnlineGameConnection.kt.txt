@@ -1,0 +1,169 @@
+// ============================================================================
+// OPT-IN FILE - not compiled by default.
+//
+// This is a full, working implementation of OnlineGameConnection backed by
+// Firebase Realtime Database. It is kept OUTSIDE app/src/main so the project
+// builds out of the box without any Firebase credentials.
+//
+// TO ENABLE (see README.md "Konfigurasi Firebase / Online Multiplayer"):
+//   1. Create your own free Firebase project + Realtime Database.
+//   2. Put google-services.json into app/google-services.json.
+//   3. In build.gradle.kts (root): uncomment the com.google.gms.google-services plugin.
+//   4. In app/build.gradle.kts: uncomment the "id(com.google.gms.google-services)"
+//      plugin line AND the firebase-bom / firebase-database-ktx / firebase-auth-ktx deps.
+//   5. Copy THIS file's content into:
+//        app/src/main/java/com/qie/chess/multiplayer/FirebaseOnlineGameConnection.kt
+//      (drop the .txt extension)
+//   6. In MultiplayerConfig.kt, set FIREBASE_CONFIGURED = true.
+//   7. Wherever DisabledOnlineGameConnection() is instantiated, swap in
+//      FirebaseOnlineGameConnection() instead.
+//
+// Suggested Realtime Database security rules (Firebase console -> Realtime
+// Database -> Rules) so clients can't tamper with someone else's game or
+// forge arbitrary positions:
+//
+// {
+//   "rules": {
+//     "rooms": {
+//       "$roomCode": {
+//         ".read": "auth != null",
+//         ".write": "auth != null && (!data.exists() || data.child('players').hasChild(auth.uid))",
+//         "fen": { ".validate": "newData.isString() && newData.val().length < 100" },
+//         "lastMoveUci": { ".validate": "newData.isString() && newData.val().length < 10" }
+//       }
+//     }
+//   }
+// }
+//
+// This still trusts the client to compute legal moves correctly (the app's
+// own ChessEngine validates before ever calling sendMove), but at minimum
+// restricts writes to authenticated participants of that exact room - the
+// same principle the brief asks for ("server harus memvalidasi..."). For a
+// stronger guarantee, add a Cloud Function that re-validates each move
+// server-side with the same ChessEngine logic (ported to Node/TS) before
+// accepting it; that is beyond this starter's scope but the hook point is
+// exactly this file's sendMove().
+// ============================================================================
+
+package com.qie.chess.multiplayer
+
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.database.DataSnapshot
+import com.google.firebase.database.DatabaseError
+import com.google.firebase.database.FirebaseDatabase
+import com.google.firebase.database.ValueEventListener
+import com.qie.chess.model.PieceColor
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.tasks.await
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
+
+class FirebaseOnlineGameConnection : OnlineGameConnection {
+
+    private val db = FirebaseDatabase.getInstance()
+    private val auth = FirebaseAuth.getInstance()
+    private var currentRoomCode: String? = null
+
+    private suspend fun ensureSignedIn(): String {
+        auth.currentUser?.let { return it.uid }
+        val result = auth.signInAnonymously().await()
+        return result.user!!.uid
+    }
+
+    override val roomState: Flow<RoomState>
+        get() = callbackFlow {
+            val roomCode = currentRoomCode
+            if (roomCode == null) {
+                close()
+                return@callbackFlow
+            }
+            val ref = db.getReference("rooms/$roomCode")
+            val listener = object : ValueEventListener {
+                override fun onDataChange(snapshot: DataSnapshot) {
+                    trySend(snapshotToRoomState(roomCode, snapshot))
+                }
+                override fun onCancelled(error: DatabaseError) {
+                    trySend(
+                        RoomState(
+                            roomCode = roomCode,
+                            status = ConnectionStatus.ERROR,
+                            errorMessage = error.message
+                        )
+                    )
+                }
+            }
+            ref.addValueEventListener(listener)
+            awaitClose { ref.removeEventListener(listener) }
+        }
+
+    override suspend fun createRoom(): String {
+        val uid = ensureSignedIn()
+        val code = RoomManager.generateRoomCode()
+        currentRoomCode = code
+        val ref = db.getReference("rooms/$code")
+        val initial = mapOf(
+            "hostUid" to uid,
+            "hostColor" to PieceColor.WHITE.name,
+            "status" to ConnectionStatus.WAITING_FOR_OPPONENT.name,
+            "fen" to null,
+            "lastMoveUci" to null,
+            "gameFinished" to false,
+            "players" to mapOf(uid to true)
+        )
+        suspendCoroutine<Unit> { cont ->
+            ref.setValue(initial) { error, _ ->
+                if (error != null) throw error.toException()
+                cont.resume(Unit)
+            }
+        }
+        return code
+    }
+
+    override suspend fun joinRoom(code: String) {
+        val uid = ensureSignedIn()
+        currentRoomCode = code
+        val ref = db.getReference("rooms/$code")
+        ref.child("players").child(uid).setValue(true).await()
+        ref.child("status").setValue(ConnectionStatus.CONNECTED.name).await()
+    }
+
+    override suspend fun sendMove(uciMove: String, resultingFen: String) {
+        val roomCode = currentRoomCode ?: return
+        val ref = db.getReference("rooms/$roomCode")
+        ref.updateChildren(
+            mapOf(
+                "lastMoveUci" to uciMove,
+                "fen" to resultingFen
+            )
+        ).await()
+    }
+
+    override suspend fun resign() {
+        val roomCode = currentRoomCode ?: return
+        db.getReference("rooms/$roomCode/gameFinished").setValue(true).await()
+    }
+
+    override suspend fun leaveRoom() {
+        currentRoomCode = null
+    }
+
+    private fun snapshotToRoomState(roomCode: String, snapshot: DataSnapshot): RoomState {
+        val status = runCatching {
+            ConnectionStatus.valueOf(snapshot.child("status").getValue(String::class.java) ?: "IDLE")
+        }.getOrDefault(ConnectionStatus.IDLE)
+        val hostColor = runCatching {
+            PieceColor.valueOf(snapshot.child("hostColor").getValue(String::class.java) ?: "WHITE")
+        }.getOrDefault(PieceColor.WHITE)
+
+        return RoomState(
+            roomCode = roomCode,
+            status = status,
+            hostColor = hostColor,
+            fen = snapshot.child("fen").getValue(String::class.java),
+            lastMoveUci = snapshot.child("lastMoveUci").getValue(String::class.java),
+            gameFinished = snapshot.child("gameFinished").getValue(Boolean::class.java) ?: false
+        )
+    }
+}
