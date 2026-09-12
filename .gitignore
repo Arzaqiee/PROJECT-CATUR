@@ -1,0 +1,28 @@
+*.iml
+.gradle/
+/local.properties
+.idea/
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+*.apk
+*.aab
+
+# Android Studio / Gradle
+/app/build/
+/app/release/
+/app/debug/
+*.keystore
+*.jks
+key.properties
+
+# Firebase - never commit real credentials
+app/google-services.json
+
+# Logs
+*.log
+
+# OS files
+Thumbs.db
